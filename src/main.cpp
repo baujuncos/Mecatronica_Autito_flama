@@ -142,16 +142,19 @@ void girarDerecha(int velocidad) {
 }
 
 // ---------- Navegación autónoma (un solo sensor TCRT5000) ----------
-// Con un único sensor centrado no se puede saber de qué lado quedó la
-// línea, así que la estrategia simple es: superficie clara -> avanzar
-// recto; línea oscura detectada -> pivotar (buscar) hacia la derecha
-// hasta recuperar la superficie clara. Se re-evalúa en cada vuelta del
-// loop, sin delay(), así que la corrección es inmediata.
+// Arranca con la línea negra debajo del sensor. Con un único sensor
+// centrado no se puede saber hacia qué lado se curvó la línea, así que la
+// estrategia simple es: sensor sobre la línea -> avanzar recto; sensor
+// perdió la línea (ve el fondo blanco) -> pivotar (buscar) hacia la
+// derecha hasta recuperarla. Se re-evalúa en cada vuelta del loop, sin
+// delay(), así que la corrección es inmediata. Sirve para curvas suaves;
+// en esquinas muy puntiagudas el pivot puede no alcanzar a recuperar la
+// línea a tiempo (ver README).
 void ejecutarNavegacionAutonoma() {
   int lectura = analogRead(TCRT_PIN);
-  bool superficieClara = lectura < UMBRAL_TCRT;
+  bool sobreLinea = lectura > UMBRAL_TCRT;
 
-  if (superficieClara) {
+  if (sobreLinea) {
     avanzar(VELOCIDAD_AUTONOMO);
   } else {
     girarDerecha(VELOCIDAD_GIRO);
