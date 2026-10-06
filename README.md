@@ -1,22 +1,27 @@
 # Mecatronica_Autito_flama
 
-Rover diferencial con ESP32, driver dual L9110S, sensor de línea TCRT5000
-(ensamblaje discreto de 3 cables) y control remoto vía panel web (WiFi
-SoftAP). Proyecto para la materia **Mecatrónica**.
+Rover diferencial con ESP32, driver dual L9110S, sensor ultrasónico HC-SR04
+(detección de obstáculos) y control remoto vía panel web (WiFi SoftAP).
+Proyecto para la materia **Mecatrónica**.
 
 ## Estado del proyecto
 
 - [x] Control de 2 motores DC (chasis diferencial) vía L9110S, con PWM (LEDC).
-- [x] Sensor de línea TCRT5000 (3 cables) leído por ADC.
+- [x] Sensor ultrasónico HC-SR04 para detección/esquive de obstáculos.
 - [x] Panel web (WiFi AP + WebServer) con controles manuales, ON/OFF y modo autónomo.
-- [x] Máquina de estados: `APAGADO`, `MANUAL_WEB`, `AUTONOMO_LINEA` (loop 100% no bloqueante).
+- [x] Máquina de estados: `APAGADO`, `MANUAL_WEB`, `AUTONOMO_OBSTACULO` (loop no bloqueante; única excepción acotada: `pulseIn()` del HC-SR04, con timeout de 25ms y muestreado cada 60ms, no en cada vuelta del loop).
 - [ ] **Pendiente**: integración del servomotor con la bandeja/soporte impreso en
       impresora 3D (mecanismo aún no diseñado/impreso). Se abordará en una
       siguiente etapa del proyecto.
 
+> **Historial**: la primera versión del proyecto usaba un sensor de línea
+> TCRT5000 (3 cables) para seguir una cinta negra. Se reemplazó por el
+> HC-SR04, cambiando el modo autónomo de "seguir línea" a "esquivar
+> obstáculos".
+
 ## Esquema de conexiones
 
-Masa común: **todos los GND** (ESP32, driver L9110S, sensor TCRT5000 y
+Masa común: **todos los GND** (ESP32, driver L9110S, sensor HC-SR04 y
 batería/fuente de los motores) deben unirse en un mismo punto de referencia.
 
 ### ESP32 <-> Driver L9110S
@@ -38,37 +43,41 @@ batería/fuente de los motores) deben unirse en un mismo punto de referencia.
 | A-1A/A-1B  | Motor izquierdo (2 cables)                 |
 | B-1A/B-2A  | Motor derecho (2 cables)                   |
 
-### ESP32 <-> Sensor TCRT5000 (ensamblaje discreto, 3 cables)
+### ESP32 <-> Sensor ultrasónico HC-SR04
 
-El sensor está armado a mano: un TCRT5000 soldado junto con su resistencia
-de polarización, formando un divisor de tensión. De ahí salen solo 3 cables:
+| HC-SR04 | Conexión                                  | Nota |
+|---------|---------------------------------------------|------|
+| VCC     | **3V3** del ESP32 (no 5V/VIN)                | Ver nota de alimentación abajo |
+| GND     | GND (masa común)                             | |
+| TRIG    | GPIO32                                       | Salida del ESP32 hacia el sensor |
+| ECHO    | GPIO34, directo, sin divisor                 | Seguro porque el sensor corre a 3.3V |
 
-| Cable del sensor | Identificación                                             | Conexión ESP32 |
-|-------------------|------------------------------------------------------------|----------------|
-| VCC               | Va a una pata del TCRT5000 (alimentación del emisor/fototransistor) | 3V3 (o 5V si el divisor fue diseñado para eso) |
-| GND               | Va al otro extremo de la resistencia de polarización        | GND (masa común) |
-| Señal             | Sale del punto medio entre el fototransistor y la resistencia (nodo intermedio del divisor) | GPIO34 (ADC1, solo entrada) |
+**Nota de alimentación**: el HC-SR04 está especificado para 4.5-5.5V, pero
+alimentado a 3.3V (VCC del sensor al pin 3V3 del ESP32) funciona en la
+práctica en la mayoría de los módulos, y como corre a 3.3V, el pulso de
+ECHO también sale a 3.3V — se puede conectar directo al GPIO sin divisor
+resistivo ni componentes extra. La contra es que el alcance máximo baja de
+~4m a ~1.5-2m aprox., lecturas algo menos estables. Para este proyecto
+(detectar un obstáculo a 15cm) sobra margen. Si notan lecturas erráticas o
+intermitentes una vez armado, la solución de respaldo es alimentar a 5V
+(VIN) y agregar un divisor resistivo en ECHO (1kΩ en serie + 2kΩ a GND)
+antes del GPIO.
 
-**Cómo identificarlos con un multímetro** (sensor desenergizado): mide
-continuidad/resistencia entre pares de cables. El par que muestra la
-resistencia de polarización fija (ej. 10kΩ) son VCC-GND. El cable restante,
-que cae en el punto medio, es la Señal.
+GPIO34 se eligió para ECHO porque es un pin **solo-entrada** de ADC1 (no
+necesita salida). GPIO32 para TRIG es un pin de uso general sin restricciones.
 
-GPIO34 se eligió porque es un pin **solo-entrada** de ADC1 (no comparte
-recursos con el WiFi, a diferencia del ADC2). GPIO32 es la alternativa
-válida si se prefiere otro pin.
-
-`UMBRAL_TCRT` (en `main.cpp`) debe calibrarse imprimiendo `analogRead()`
-por Serial sobre la superficie real del circuito (fondo claro vs. línea
-oscura), ya que el valor sube o baja según cómo se haya armado el divisor.
+`UMBRAL_DISTANCIA_CM` (en `main.cpp`, valor por defecto 15cm) define a qué
+distancia el rover considera que hay un obstáculo y empieza a esquivarlo;
+ajustar según el tamaño de la pista y la velocidad de reacción deseada.
 
 ## Panel de control web
 
 1. El ESP32 crea una red WiFi propia: SSID `Rover-ESP32`, contraseña `12345678`.
 2. Conectarse a esa red desde el celular o PC y abrir `http://192.168.4.1/`.
 3. Controles disponibles: Adelante / Atrás / Izquierda / Derecha / Frenar,
-   botón ON/OFF (habilita/deshabilita motores) y botón de Modo Autónomo
-   (sigue-línea con el TCRT5000; al detenerlo vuelve a modo manual).
+   botón ON/OFF (habilita/deshabilita motores) y botón "Esquivar Obstáculos"
+   (modo autónomo con el HC-SR04; al detenerlo vuelve a modo manual). El
+   panel muestra la distancia medida en cm en tiempo real.
 
 ## Compilar y subir (PlatformIO)
 
