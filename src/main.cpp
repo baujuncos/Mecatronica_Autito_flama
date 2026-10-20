@@ -10,6 +10,10 @@
                       HC-SR04, ignorando los botones de dirección (solo
                       "Detener" lo saca de este modo).
 
+  Además hay una bandeja volcable con servo SG90, independiente de la
+  máquina de estados de arriba: se dispara por botón web, por pulsador
+  físico, o sola al detectar un obstáculo en modo autónomo.
+
   Todo el loop() es no bloqueante (sin delay), usando millis() donde hace
   falta temporizar. La única excepción acotada es pulseIn() del HC-SR04,
   que bloquea como máximo ECO_TIMEOUT_US y solo se llama cada
@@ -20,6 +24,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESP32Servo.h>
 
 // ---------- Driver L298N: entradas IN1..IN4 ----------
 // Motor A (izquierdo) en OUT1/OUT2, Motor B (derecho) en OUT3/OUT4.
@@ -34,7 +39,7 @@ const int MOTOR_B_REVERSA  = 14;   // -> IN4
 // ---------- Parámetros PWM ----------
 const int PWM_FREQ = 20000;
 const int PWM_RESOLUTION = 8;
-const int PWM_MAX = 255;
+const int PWM_MAX = 230;
 
 const int CH_MOTOR_A_ADELANTE = 0;
 const int CH_MOTOR_A_REVERSA  = 1;
@@ -71,6 +76,38 @@ long medirDistanciaCm() {
   return duracion / 58; // fórmula estándar del HC-SR04: us / 58 = cm
 }
 
+// ---------- Bandeja volcable (servo SG90) ----------
+// El servo va acostado sobre el chasis y su brazo (hornilla) sube en
+// perpendicular sosteniendo la bandeja. Reposo = bandeja paralela al suelo;
+// descarga = bandeja perpendicular al suelo (vuelca el contenido).
+const int SERVO_PIN = 13;        // GPIO13: sin función especial al arrancar
+const int PIN_BOTON_VOLCAR = 33; // pulsador físico opcional (a GND, con pull-up interno)
+
+// Pulsos típicos del SG90 a 50 Hz. Si el servo zumba o topa al llegar al
+// extremo, acortar el rango (p. ej. 600-2300); no se recomienda salir de 500-2400.
+const int SERVO_PULSO_MIN_US = 500;  // ancho de pulso que corresponde a 0°
+const int SERVO_PULSO_MAX_US = 2400; // ancho de pulso que corresponde a 180°
+
+// AFINACIÓN DE NIVELACIÓN: son los dos únicos valores a tocar para calibrar.
+//  - ANGULO_REPOSO: si la bandeja queda inclinada al transportar, subir o
+//    bajar de a 1-2° (rango válido 0-180) hasta que quede paralela al suelo.
+//  - ANGULO_DESCARGA: el servo gira de 0° hacia 90°, así que si la bandeja no
+//    llega a la vertical, aumentar (92, 95...); si se pasa, disminuir (88, 85...).
+// Para volver a invertir el sentido de giro: intercambiar los dos valores
+// (0 <-> 180) y remontar la hornilla del lado opuesto.
+const int ANGULO_REPOSO   = 0;
+const int ANGULO_DESCARGA = 90;
+
+const unsigned long TIEMPO_DESCARGA_MS = 2000; // pausa arriba para que caiga lo depositado
+
+// Los canales LEDC 0-3 (20 kHz) de los motores usan los timers 0 y 1; en
+// setup() se restringe ESP32Servo a los timers 2 y 3 para no pisarlos.
+Servo servoBandeja;
+
+enum EstadoBandeja { BANDEJA_REPOSO, BANDEJA_DESCARGANDO };
+EstadoBandeja estadoBandeja = BANDEJA_REPOSO;
+unsigned long inicioDescargaMs = 0;
+
 // ---------- Velocidades ----------
 const int VELOCIDAD_MANUAL    = 255;
 const int VELOCIDAD_GIRO      = 255;
@@ -79,7 +116,7 @@ const int VELOCIDAD_AUTONOMO  = 230;
 // ponytail: compensación fija por desbalance entre ruedas, en 0 para que
 // ambas reciban la misma potencia con el L298N. Subir este valor solo si el
 // rover se va a un lado al ir recto.
-const int TRIM_IZQUIERDA = 15;
+const int TRIM_IZQUIERDA = 10;
 
 // ---------- WiFi AP ----------
 const char *AP_SSID = "Rover-ESP32";
@@ -189,6 +226,43 @@ void girarDerecha(int velocidad) {
   motorDerecho(-v);
 }
 
+// ---------- Bandeja: secuencia inclinar -> pausa -> retorno ----------
+// Funciona en paralelo a la máquina de estados del rover (no es un
+// EstadoRover más): un volcado puede dispararse en MANUAL_WEB, en
+// AUTONOMO_OBSTACULO o con el pulsador físico, sin interferir con los
+// motores.
+
+// Dispara la secuencia. No bloquea: solo manda el servo a la posición de
+// descarga y arranca el cronómetro; el retorno lo hace actualizarBandeja().
+// Si ya hay una descarga en curso, la orden se ignora.
+void volcarBandeja() {
+  if (estadoBandeja != BANDEJA_REPOSO) return;
+  servoBandeja.write(ANGULO_DESCARGA);
+  inicioDescargaMs = millis();
+  estadoBandeja = BANDEJA_DESCARGANDO;
+}
+
+// Se llama en cada vuelta del loop: vuelve al reposo pasado el tiempo de espera.
+void actualizarBandeja() {
+  if (estadoBandeja == BANDEJA_DESCARGANDO &&
+      millis() - inicioDescargaMs >= TIEMPO_DESCARGA_MS) {
+    servoBandeja.write(ANGULO_REPOSO);
+    estadoBandeja = BANDEJA_REPOSO;
+  }
+}
+
+// Lee el disparador físico (flanco de bajada = pulsador presionado).
+void leerBotonVolcar() {
+  static bool anterior = HIGH;
+  static unsigned long ultimoCambioMs = 0;
+  bool actual = digitalRead(PIN_BOTON_VOLCAR);
+  if (actual != anterior && millis() - ultimoCambioMs > 50) { // antirrebote
+    ultimoCambioMs = millis();
+    anterior = actual;
+    if (actual == LOW) volcarBandeja();
+  }
+}
+
 // ---------- Comando manual actual ----------
 // Los botones del panel web mandan un solo request por click (no
 // mantienen el botón apretado), así que guardamos el último comando y lo
@@ -214,6 +288,17 @@ void aplicarComandoManual() {
   }
 }
 
+// ---------- Temporizador de volcado en modo autónomo ----------
+// A los TIEMPO_AUTONOMO_ANTES_DE_VOLCAR_MS de haber entrado en
+// AUTONOMO_OBSTACULO, vuelca la bandeja una sola vez (no se repite en la
+// misma sesión autónoma); el rover sigue esquivando obstáculos antes,
+// durante (frenado, ver loop()) y después del volcado. handleAuto()
+// reinicia inicioAutonomoMs y volcadoAutonomoHecho cada vez que se activa
+// el modo.
+const unsigned long TIEMPO_AUTONOMO_ANTES_DE_VOLCAR_MS = 5000;
+unsigned long inicioAutonomoMs = 0;
+bool volcadoAutonomoHecho = false;
+
 // ---------- Navegación autónoma (esquiva obstáculos con el HC-SR04) ----------
 // Avanza en línea recta; si detecta un obstáculo a menos de
 // UMBRAL_DISTANCIA_CM, gira hacia la derecha hasta despejar el camino. La
@@ -222,6 +307,12 @@ void aplicarComandoManual() {
 void ejecutarNavegacionAutonoma() {
   static unsigned long ultimaLectura = 0;
   static long distanciaCm = -1;
+
+  if (!volcadoAutonomoHecho &&
+      millis() - inicioAutonomoMs >= TIEMPO_AUTONOMO_ANTES_DE_VOLCAR_MS) {
+    volcarBandeja();
+    volcadoAutonomoHecho = true;
+  }
 
   if (millis() - ultimaLectura >= INTERVALO_LECTURA_MS) {
     ultimaLectura = millis();
@@ -234,6 +325,18 @@ void ejecutarNavegacionAutonoma() {
     girarDerecha(VELOCIDAD_GIRO);
   } else {
     avanzar(VELOCIDAD_AUTONOMO);
+  }
+}
+
+// Diagnóstico: por qué arrancó el ESP32 (BROWNOUT = caída de tensión).
+const char *motivoReinicio() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "POWERON (encendido normal)";
+    case ESP_RST_BROWNOUT: return "BROWNOUT (caida de tension)";
+    case ESP_RST_SW:       return "SW (reinicio por software)";
+    case ESP_RST_PANIC:    return "PANIC (error de programa)";
+    case ESP_RST_WDT: case ESP_RST_INT_WDT: case ESP_RST_TASK_WDT: return "WATCHDOG";
+    default:               return "OTRO";
   }
 }
 
@@ -256,6 +359,8 @@ const char PAGINA_HTML[] PROGMEM = R"HTML(
   .toggles { display:flex; gap:12px; justify-content:center; flex-wrap:wrap; }
   .toggles button { min-width:150px; background:#245; }
   .toggles button.on { background:#2a5; }
+  .bandeja { margin-top:16px; min-width:200px; background:#a70; }
+  .bandeja.activo { background:#333; color:#999; }
 </style>
 </head>
 <body>
@@ -279,12 +384,22 @@ const char PAGINA_HTML[] PROGMEM = R"HTML(
     <button id="btnAuto" onclick="toggleAuto()">Esquivar Obstáculos</button>
   </div>
 
+  <button class="bandeja" id="btnBandeja" onclick="volcar()">Volcar bandeja</button>
+
 <script>
 let power = false;
 let auto = false;
 
 function cmd(d) {
   fetch('/api/dir?d=' + d);
+}
+
+function volcar() {
+  const b = document.getElementById('btnBandeja');
+  fetch('/api/volcar');
+  b.classList.add('activo');
+  b.innerText = 'Volcando...';
+  setTimeout(() => { b.classList.remove('activo'); b.innerText = 'Volcar bandeja'; }, 2500);
 }
 
 function togglePower() {
@@ -351,12 +466,19 @@ void handleAuto() {
   bool activar = server.arg("v") == "1";
   if (activar && estadoActual == MANUAL_WEB) {
     estadoActual = AUTONOMO_OBSTACULO;
+    inicioAutonomoMs = millis();
+    volcadoAutonomoHecho = false;
   } else if (!activar && estadoActual == AUTONOMO_OBSTACULO) {
     frenarTodo();
     liberarTodo();
     estadoActual = MANUAL_WEB;
     comandoManual = 's';
   }
+  server.send(200, "text/plain", "ok");
+}
+
+void handleVolcar() {
+  volcarBandeja();
   server.send(200, "text/plain", "ok");
 }
 
@@ -369,9 +491,27 @@ void handleStatus() {
 }
 
 void setup() {
+  // Lo primerísimo, antes de cualquier otra cosa: forzar los 4 pines del
+  // L298N a LOW apenas arranca el sketch (antes de ledcAttachPin). Esto NO
+  // evita que un motor gire DURANTE la subida del firmware (ahí el ESP32
+  // está en el bootloader, sin ejecutar nuestro código todavía; eso se
+  // arregla con una resistencia pull-down de 10k a GND en cada pin IN del
+  // L298N), pero sí achica al mínimo la ventana posterior, entre que
+  // termina la subida y el PWM queda configurado.
+  pinMode(MOTOR_A_ADELANTE, OUTPUT);
+  pinMode(MOTOR_A_REVERSA, OUTPUT);
+  pinMode(MOTOR_B_ADELANTE, OUTPUT);
+  pinMode(MOTOR_B_REVERSA, OUTPUT);
+  digitalWrite(MOTOR_A_ADELANTE, LOW);
+  digitalWrite(MOTOR_A_REVERSA, LOW);
+  digitalWrite(MOTOR_B_ADELANTE, LOW);
+  digitalWrite(MOTOR_B_REVERSA, LOW);
+
   Serial.begin(115200);
   delay(500);
   Serial.println("Iniciando rover con control web + HC-SR04...");
+  Serial.print("Motivo del ultimo reinicio: ");
+  Serial.println(motivoReinicio());
 
   ledcSetup(CH_MOTOR_A_ADELANTE, PWM_FREQ, PWM_RESOLUTION);
   ledcSetup(CH_MOTOR_A_REVERSA, PWM_FREQ, PWM_RESOLUTION);
@@ -389,6 +529,14 @@ void setup() {
   pinMode(ECHO_PIN, INPUT);
   digitalWrite(TRIG_PIN, LOW);
 
+  // Servo SG90: usar solo los timers 2-3 (los 0-1 son de los motores), 50 Hz, pulsos 500-2400 us
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  servoBandeja.setPeriodHertz(50);
+  servoBandeja.attach(SERVO_PIN, SERVO_PULSO_MIN_US, SERVO_PULSO_MAX_US);
+  // Sin write() acá: el servo no se mueve al encender; recién actúa en la primera descarga.
+  pinMode(PIN_BOTON_VOLCAR, INPUT_PULLUP);
+
   WiFi.softAP(AP_SSID, AP_PASS);
   Serial.print("AP iniciado. IP: ");
   Serial.println(WiFi.softAPIP());
@@ -397,14 +545,24 @@ void setup() {
   server.on("/api/dir", handleDir);
   server.on("/api/power", handlePower);
   server.on("/api/auto", handleAuto);
+  server.on("/api/volcar", handleVolcar);
   server.on("/api/status", handleStatus);
   server.begin();
 }
 
 void loop() {
   server.handleClient();
+  leerBotonVolcar();
+  actualizarBandeja();
 
-  if (estadoActual == MANUAL_WEB) {
+  // El servo y los motores a fondo tirando corriente al mismo tiempo es lo
+  // que más hace caer la tensión del powerbank y provoca brownouts (el
+  // ESP32 se resetea solo). Mientras la bandeja está volcando, se frenan
+  // los motores (en cualquier modo) para no sumar los dos picos de
+  // corriente; el comando pendiente se retoma solo cuando termina.
+  if (estadoBandeja == BANDEJA_DESCARGANDO) {
+    frenarTodo();
+  } else if (estadoActual == MANUAL_WEB) {
     aplicarComandoManual();
   } else if (estadoActual == AUTONOMO_OBSTACULO) {
     ejecutarNavegacionAutonoma();
