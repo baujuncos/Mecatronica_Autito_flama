@@ -15,7 +15,6 @@ entre ambos. Proyecto para la materia **Mecatrónica**.
 - [X] Panel web (WiFi AP + WebServer) con controles manuales, ON/OFF, modo
   autónomo y volcado de bandeja.
 - [X] Máquina de estados: `APAGADO`, `MANUAL_WEB`, `AUTONOMO_OBSTACULO` (loop no bloqueante; única excepción acotada: `pulseIn()` del HC-SR04, con timeout de 25ms y muestreado cada 60ms, no en cada vuelta del loop). La bandeja es independiente de esta máquina de estados: puede volcar en cualquiera de los tres estados.
-- [X] Resistencias pull-down (10kΩ a GND) en los 4 pines del L298N (GPIO26/25/27/14), para que ningún motor gire solo mientras el ESP32 está en el bootloader subiendo el firmware.
 
 > **Historial**: la primera versión del proyecto usaba un sensor de línea
 > TCRT5000 (3 cables) para seguir una cinta negra. Se reemplazó por el
