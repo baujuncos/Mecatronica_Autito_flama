@@ -37,7 +37,8 @@ const int MOTOR_B_ADELANTE = 27;   // -> IN3
 const int MOTOR_B_REVERSA  = 14;   // -> IN4
 
 // ---------- Parámetros PWM ----------
-const int PWM_FREQ = 20000;
+// 5 kHz: el L298N es lento y a 20 kHz pierde más potencia en el driver.
+const int PWM_FREQ = 5000;
 const int PWM_RESOLUTION = 8;
 const int PWM_MAX = 230;
 
@@ -109,9 +110,11 @@ EstadoBandeja estadoBandeja = BANDEJA_REPOSO;
 unsigned long inicioDescargaMs = 0;
 
 // ---------- Velocidades ----------
-const int VELOCIDAD_MANUAL    = 255;
-const int VELOCIDAD_GIRO      = 255;
-const int VELOCIDAD_AUTONOMO  = 230;
+// Bajadas desde 255/255/230 para pedir menos corriente.
+// Si con esto los motores quedan flojos, subir de a 10 hasta 255.
+const int VELOCIDAD_MANUAL    = 220;
+const int VELOCIDAD_GIRO      = 220;
+const int VELOCIDAD_AUTONOMO  = 220;
 
 // ponytail: compensación fija por desbalance entre ruedas, en 0 para que
 // ambas reciban la misma potencia con el L298N. Subir este valor solo si el
@@ -196,16 +199,9 @@ void retroceder(int velocidad) {
   motorDerecho(-v);
 }
 
-// Frenado activo en ambos motores (las 4 entradas en HIGH)
-void frenarTodo() {
-  enMovimiento = false;
-  ledcWrite(CH_MOTOR_A_ADELANTE, PWM_MAX);
-  ledcWrite(CH_MOTOR_A_REVERSA, PWM_MAX);
-  ledcWrite(CH_MOTOR_B_ADELANTE, PWM_MAX);
-  ledcWrite(CH_MOTOR_B_REVERSA, PWM_MAX);
-}
-
-// Punto muerto (las 4 entradas en LOW)
+// Punto muerto (las 4 entradas en LOW). Es la forma de parar: no se usa
+// freno activo (4 entradas en HIGH) porque cortar en seco un motor girando
+// mete picos de corriente en la fuente.
 void liberarTodo() {
   enMovimiento = false;
   motorIzquierdo(0);
@@ -284,7 +280,7 @@ void aplicarComandoManual() {
     case 'b': retroceder(VELOCIDAD_MANUAL); break;
     case 'l': girarIzquierda(VELOCIDAD_GIRO); break;
     case 'r': girarDerecha(VELOCIDAD_GIRO); break;
-    default:  frenarTodo(); break;
+    default:  liberarTodo(); break;
   }
 }
 
@@ -301,9 +297,25 @@ bool volcadoAutonomoHecho = false;
 
 // ---------- Navegación autónoma (esquiva obstáculos con el HC-SR04) ----------
 // Avanza en línea recta; si detecta un obstáculo a menos de
-// UMBRAL_DISTANCIA_CM, gira hacia la derecha hasta despejar el camino. La
+// UMBRAL_DISTANCIA_CM: frena, retrocede un
+// poco y gira a la derecha, con una pausa de motores libres antes de invertir
+// el sentido (invertir una rueda a toda velocidad es el mayor pico de
+// corriente). Es una máquina de fases con millis(), no bloquea el loop. La
 // lectura del sensor se limita a una vez cada INTERVALO_LECTURA_MS (en vez
 // de cada vuelta del loop) para no bloquear tan seguido con pulseIn().
+enum FaseEsquive { FASE_AVANZANDO, FASE_PARANDO, FASE_RETROCEDIENDO, FASE_GIRANDO };
+FaseEsquive faseEsquive = FASE_AVANZANDO;
+unsigned long inicioFaseMs = 0;
+
+const unsigned long PAUSA_ANTES_RETROCEDER_MS = 200;
+const unsigned long RETROCESO_MS = 400;
+const unsigned long GIRO_MS = 500;
+
+void cambiarFase(FaseEsquive nueva) {
+  faseEsquive = nueva;
+  inicioFaseMs = millis();
+}
+
 void ejecutarNavegacionAutonoma() {
   static unsigned long ultimaLectura = 0;
   static long distanciaCm = -1;
@@ -321,10 +333,28 @@ void ejecutarNavegacionAutonoma() {
 
   bool obstaculoCerca = distanciaCm > 0 && distanciaCm < UMBRAL_DISTANCIA_CM;
 
-  if (obstaculoCerca) {
-    girarDerecha(VELOCIDAD_GIRO);
-  } else {
-    avanzar(VELOCIDAD_AUTONOMO);
+  unsigned long enFase = millis() - inicioFaseMs;
+  switch (faseEsquive) {
+    case FASE_AVANZANDO:
+      if (obstaculoCerca) {
+        liberarTodo();
+        cambiarFase(FASE_PARANDO);
+      } else {
+        avanzar(VELOCIDAD_AUTONOMO);
+      }
+      break;
+    case FASE_PARANDO:
+      liberarTodo();
+      if (enFase >= PAUSA_ANTES_RETROCEDER_MS) cambiarFase(FASE_RETROCEDIENDO);
+      break;
+    case FASE_RETROCEDIENDO:
+      retroceder(VELOCIDAD_AUTONOMO);
+      if (enFase >= RETROCESO_MS) cambiarFase(FASE_GIRANDO);
+      break;
+    case FASE_GIRANDO:
+      girarDerecha(VELOCIDAD_GIRO);
+      if (enFase >= GIRO_MS) cambiarFase(FASE_AVANZANDO);
+      break;
   }
 }
 
@@ -468,8 +498,8 @@ void handleAuto() {
     estadoActual = AUTONOMO_OBSTACULO;
     inicioAutonomoMs = millis();
     volcadoAutonomoHecho = false;
+    cambiarFase(FASE_AVANZANDO);
   } else if (!activar && estadoActual == AUTONOMO_OBSTACULO) {
-    frenarTodo();
     liberarTodo();
     estadoActual = MANUAL_WEB;
     comandoManual = 's';
@@ -538,6 +568,8 @@ void setup() {
   pinMode(PIN_BOTON_VOLCAR, INPUT_PULLUP);
 
   WiFi.softAP(AP_SSID, AP_PASS);
+  // Menos potencia de transmisión = picos de corriente más chicos.
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
   Serial.print("AP iniciado. IP: ");
   Serial.println(WiFi.softAPIP());
 
@@ -561,7 +593,7 @@ void loop() {
   // los motores (en cualquier modo) para no sumar los dos picos de
   // corriente; el comando pendiente se retoma solo cuando termina.
   if (estadoBandeja == BANDEJA_DESCARGANDO) {
-    frenarTodo();
+    liberarTodo();
   } else if (estadoActual == MANUAL_WEB) {
     aplicarComandoManual();
   } else if (estadoActual == AUTONOMO_OBSTACULO) {

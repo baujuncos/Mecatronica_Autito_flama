@@ -14,6 +14,7 @@ entre ambos. Proyecto para la materia **Mecatrónica**.
   automático a los 5s de entrar en modo autónomo.
 - [X] Panel web (WiFi AP + WebServer) con controles manuales, ON/OFF, modo
   autónomo y volcado de bandeja.
+- [X] Sin brownouts con los dos powerbanks: WiFi a menor potencia, motores libres en vez de freno activo, esquive con pausas y velocidades más bajas (ver "Cómo se resolvieron los brownouts").
 - [X] Máquina de estados: `APAGADO`, `MANUAL_WEB`, `AUTONOMO_OBSTACULO` (loop no bloqueante; única excepción acotada: `pulseIn()` del HC-SR04, con timeout de 25ms y muestreado cada 60ms, no en cada vuelta del loop). La bandeja es independiente de esta máquina de estados: puede volcar en cualquiera de los tres estados.
 
 > **Historial**: la primera versión del proyecto usaba un sensor de línea
@@ -72,10 +73,11 @@ sobre ENA/ENB.
 **Nota de alimentación**: aunque los motores ya tienen su propio powerbank,
 sigue siendo una fuente de 5V. El L298N pierde cerca de 2V entre VS y los
 motores, así que éstos reciben bastante menos de 5V reales. Por eso
-`PWM_ARRANQUE` y las constantes `VELOCIDAD_*` en `main.cpp` están al máximo
-o cerca del máximo (ver sección de calibración más abajo): es la forma de
-compensar por software la falta de potencia de esta fuente. Separar los
-powerbanks evita que esos picos reseteen el ESP32, pero si se quiere más
+`PWM_ARRANQUE` y las constantes `VELOCIDAD_*` en `main.cpp` están en valores
+altos (220; ver sección de calibración más abajo): es la forma de compensar
+por software la falta de potencia de esta fuente, sin llegar al máximo de
+255 para no pedir más corriente de la necesaria. Separar los powerbanks
+evita que los picos de los motores reseteen el ESP32, pero si se quiere más
 par en las ruedas hace falta subir el voltaje de la fuente de motores
 (7.4-9V) o cambiar a un driver de menor caída (TB6612FNG); ahí sí se pueden
 bajar los valores de `VELOCIDAD_*` y el rover va a responder mejor.
@@ -126,7 +128,7 @@ descarga = bandeja volcada.
 - Automático: a los 5 segundos de activar el modo autónomo (`TIEMPO_AUTONOMO_ANTES_DE_VOLCAR_MS` en `main.cpp`), vuelca una sola vez por sesión autónoma y el rover sigue esquivando obstáculos antes y después.
 
 Mientras la bandeja está volcando (2 segundos, `TIEMPO_DESCARGA_MS`), el
-rover frena los motores por completo, en cualquier modo. Es a propósito: el
+rover deja los motores libres (en punto muerto), en cualquier modo. Es a propósito: el
 servo y los motores tirando corriente al mismo tiempo es lo que más hace
 caer la tensión y puede resetear el ESP32 (brownout).
 
@@ -143,10 +145,47 @@ sobre todo la rueda derecha. Constantes en `main.cpp` para ajustar si hace falta
 - `PWM_ARRANQUE`: PWM mínimo con el que arranca la rampa de aceleración (en
   vez de arrancar desde 0). Subirlo si alguna rueda sigue sin arrancar sola.
 - `VELOCIDAD_MANUAL`, `VELOCIDAD_GIRO`, `VELOCIDAD_AUTONOMO`: velocidades
-  objetivo de cada modo. Están altas (algunas al máximo de 255) para
-  compensar la caída de tensión del L298N.
+  objetivo de cada modo. Están en 220: lo bastante altas para compensar la
+  caída de tensión del L298N, pero por debajo de 255 para no pedir picos de
+  corriente de más. Si los motores quedan flojos, subir de a 10 y comprobar
+  que no vuelvan los reinicios por brownout.
 - `TRIM_IZQUIERDA`: compensación de potencia entre ruedas al ir recto;
   subir/bajar de a poco si el rover se va para un lado al avanzar derecho.
+- `PWM_FREQ` (5 kHz): frecuencia del PWM de los motores. Con el L298N,
+  frecuencias altas (se probó 20 kHz) hacen que el driver pierda más
+  potencia en conmutar, y el motor recibe menos de lo esperado.
+- `PAUSA_ANTES_RETROCEDER_MS`, `RETROCESO_MS`, `GIRO_MS`: duración de cada
+  fase del esquive en modo autónomo (ver más abajo).
+
+## Cómo se resolvieron los brownouts
+
+El rover se reiniciaba solo por caídas de tensión (ver sección de
+diagnóstico). Después de revisar el consumo de cada parte, estos cambios en
+el código lo dejaron andando estable con los dos powerbanks:
+
+1. **WiFi con menos potencia de transmisión**
+   (`WiFi.setTxPower(WIFI_POWER_8_5dBm)`): el AP del ESP32 con potencia por
+   defecto tiene picos de corriente de unos 250-300 mA, y alcanza de sobra
+   para controlar el rover desde cerca.
+2. **Motores libres en vez de freno activo**: antes, al soltar un botón, el
+   rover frenaba con las 4 entradas del L298N en HIGH, lo que corta en seco
+   un motor que está girando y mete picos en la fuente. Ahora para con las
+   4 entradas en LOW (`liberarTodo()`), y el rover se detiene por inercia y
+   fricción.
+3. **Esquive con pausas** en modo autónomo: antes, ante un obstáculo, una
+   rueda invertía su sentido a plena velocidad de golpe, que es el mayor
+   pico de corriente que pueden pedir los motores. Ahora la secuencia es
+   avanzar → motores libres 200 ms → retroceder 400 ms → girar a la derecha
+   500 ms → avanzar. Está implementada como una máquina de fases con
+   `millis()` (`FaseEsquive`), así que el loop sigue sin bloquearse.
+4. **Velocidades más bajas** (255/255/230 → 220/220/220): menos corriente
+   de arranque y de giro.
+5. **PWM de motores a 5 kHz** (antes 20 kHz): el L298N rinde mejor a
+   frecuencias más bajas.
+
+No se probó cambio por cambio, así que no se sabe cuál pesó más; si en el
+futuro se vuelve a subir la velocidad o se agrega otro consumo, conviene
+hacerlo de a poco y revisar el motivo de reinicio por Serial.
 
 ## Diagnóstico de reinicios (brownout)
 
